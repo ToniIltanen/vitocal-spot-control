@@ -90,6 +90,126 @@ network interfaces and currently has **no password or HTTPS**. Do not forward
 the dashboard port from your router or expose it to the public internet: anyone
 who can reach it can submit heating-control requests.
 
+### Fresh Raspberry Pi installation
+
+These steps assume a Raspberry Pi 3 or newer, Raspberry Pi OS Lite 64-bit, an
+internet connection, and SSH access. Raspberry Pi 4 with 2 GB RAM or more is a
+good fit. Use Raspberry Pi Imager to write the OS, configure a username and
+password, enable SSH, and join the Pi to your home network. Ethernet and a DHCP
+reservation in the router are recommended so the Pi's address stays stable.
+
+Connect to the Pi from another computer:
+
+```sh
+ssh <user>@<raspberry-pi-ip>
+```
+
+Update Raspberry Pi OS and install the build tools:
+
+```sh
+sudo apt update
+sudo apt full-upgrade -y
+sudo apt install -y build-essential pkg-config curl git
+```
+
+Install Rust for the logged-in user, then load Cargo into this shell:
+
+```sh
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+. "$HOME/.cargo/env"
+rustc --version
+cargo --version
+```
+
+Get the project source. Replace the placeholder with the repository URL if it
+is hosted in Git; alternatively copy the project directory to the Pi:
+
+```sh
+git clone <repository-url> rust-viessman-control
+cd rust-viessman-control
+cargo build --release
+```
+
+Before starting the service for the first time, configure the OAuth client ID
+in the Viessmann Developer Portal with the exact redirect URI
+`http://localhost:51125`. Open an SSH tunnel from the computer that will open
+the sign-in page (in a separate terminal and keep it running):
+
+```sh
+ssh -N -L 51125:127.0.0.1:51125 <user>@<raspberry-pi-ip>
+```
+
+Back in the Pi's SSH session, start the monitor once interactively:
+
+```sh
+export VIESSMANN_CLIENT_ID='<your-client-id>'
+./target/release/rust-viessman-control --monitor
+```
+
+If the Pi has no browser, copy the Viessmann sign-in URL printed in that SSH
+session into a browser on your computer. Complete the sign-in while the tunnel
+is active; the callback is forwarded to the Pi. Once the monitor reports that
+it is running, open `http://<raspberry-pi-ip>:8787/` on your phone, verify the
+readings, and stop the interactive monitor with Ctrl+C. The OAuth token is
+stored for the Pi user, so run the system service below as that same user.
+
+To start the monitor automatically after reboot, create a root-owned
+environment file for the client ID:
+
+```sh
+sudo install -m 600 /dev/null /etc/vicare-controller.env
+sudo nano /etc/vicare-controller.env
+```
+
+Put this single line in the file and save it:
+
+```text
+VIESSMANN_CLIENT_ID=<your-client-id>
+```
+
+Create `/etc/systemd/system/vicare-controller.service`, replacing `<user>` in
+the paths and `User` value with the Pi login name:
+
+```sh
+sudo nano /etc/systemd/system/vicare-controller.service
+```
+
+Put this in the file:
+
+```ini
+[Unit]
+Description=Viessmann heat-pump price controller
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=<user>
+WorkingDirectory=/home/<user>/rust-viessman-control
+EnvironmentFile=/etc/vicare-controller.env
+ExecStart=/home/<user>/rust-viessman-control/target/release/rust-viessman-control --monitor
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start the service, then inspect its logs:
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now vicare-controller
+sudo systemctl status vicare-controller
+journalctl -u vicare-controller -f
+```
+
+The dashboard remains available at `http://<raspberry-pi-ip>:8787/` while the
+service is running. Use `sudo systemctl stop vicare-controller` to stop it and
+`sudo systemctl restart vicare-controller` after building an updated release.
+Keep TCP port 8787 inside a trusted home network; do not configure router port
+forwarding for it. The web dashboard itself has no authentication.
+
 For the first sign-in on a headless Pi, start an SSH tunnel from your computer
 before launching the monitor:
 
