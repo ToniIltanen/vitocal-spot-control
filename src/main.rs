@@ -185,7 +185,33 @@ struct RoomTelemetry {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let monitor_mode = env::args().any(|argument| argument == "--monitor");
+    let mut monitor_mode = false;
+    let mut startup_mode = None;
+    let mut arguments = env::args().skip(1);
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--monitor" => monitor_mode = true,
+            "--mode" => {
+                let mode = arguments
+                    .next()
+                    .context("Missing mode after --mode; choose light, normal, or strong")?;
+                startup_mode = Some(match mode.as_str() {
+                    "light" => dashboard::ControlMode::Light,
+                    "normal" => dashboard::ControlMode::Normal,
+                    "strong" => dashboard::ControlMode::Strong,
+                    _ => bail!("Unsupported mode '{mode}'; choose light, normal, or strong"),
+                });
+            }
+            "--help" | "-h" => {
+                println!("Usage: rust-viessman-control [--monitor [--mode light|normal|strong]]");
+                return Ok(());
+            }
+            _ => bail!("Unknown argument '{argument}'; use --help for usage"),
+        }
+    }
+    if startup_mode.is_some() && !monitor_mode {
+        bail!("--mode can only be used together with --monitor");
+    }
     let client_id = env::var("VIESSMANN_CLIENT_ID")
         .context("Set VIESSMANN_CLIENT_ID to your Viessmann Developer Portal client ID")?;
     let redirect_uri =
@@ -245,6 +271,7 @@ async fn main() -> Result<()> {
             &token_path,
             heat_pump,
             room_control,
+            startup_mode,
         )
         .await?;
         return Ok(());

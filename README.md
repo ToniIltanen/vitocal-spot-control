@@ -81,6 +81,30 @@ for another device in the same installation.
 cargo run --release -- --monitor
 ```
 
+By default, the monitor starts with automatic control off. To start it
+immediately in a selected strength, pass `--mode light`, `--mode normal`, or
+`--mode strong`:
+
+```sh
+./target/release/rust-viessman-control --monitor --mode light
+./target/release/rust-viessman-control --monitor --mode normal
+./target/release/rust-viessman-control --monitor --mode strong
+```
+
+When running from the source tree, use the equivalent Cargo commands:
+
+```sh
+cargo run --release -- --monitor --mode light
+cargo run --release -- --monitor --mode normal
+cargo run --release -- --monitor --mode strong
+```
+
+The selected mode is used for the initial automatic-control start after ViCare
+and room-sensor safety checks succeed. The dashboard button is green and says
+**Käynnistä ohjaus** while control is off. While control is running it turns
+blue and says **Muuta ohjausta**; select another strength and press it to apply
+the new mode without restarting the monitor.
+
 The monitor can run headlessly on a Raspberry Pi or another always-on Linux
 server. It does not open a browser on the server. To open the dashboard from a
 phone, connect the phone to the same trusted home network and visit
@@ -195,6 +219,10 @@ RestartSec=10
 WantedBy=multi-user.target
 ```
 
+To select a startup strength for the system service, append `--mode light`,
+`--mode normal`, or `--mode strong` to its `ExecStart` command, then reload and
+restart the service.
+
 Enable and start the service, then inspect its logs:
 
 ```sh
@@ -229,12 +257,16 @@ feature every five minutes for a separate diagnostic reading; a percent reading
 is labeled as compressor load, not electrical power, and is not plotted as
 consumption. Historical compressor sensor readings, accepted power samples,
 room-temperature sensor readings, the
-automatic controller's applied heating-curve shift, and prices are retained in
+automatic controller's applied heating-curve shift, outdoor-temperature and
+heating-circuit supply-temperature readings, and prices are retained in
 `power-price-history.json` in the project directory from which the monitor is
-launched. Room temperature is sampled every five minutes and stored with the
-timestamp reported by ViCare; repeated polls of the same Zigbee reading are not
-duplicated. While automatic control is active, the current heating-curve shift
-is recorded every five minutes and immediately when the controller changes it.
+launched. Room, outdoor, and supply temperatures are sampled every five minutes
+and stored with the timestamp reported by ViCare; repeated polls of the same
+sensor reading are not duplicated. Outdoor and supply temperatures are
+collected for observation only and do not affect control. Supply temperature is
+read from `heating.secondaryCircuit.sensors.temperature.supply`.
+While automatic control is active, the current heating-curve shift is recorded
+every five minutes and immediately when the controller changes it.
 The monitor prints the full path at startup. If the
 old Application Support history exists and
 there is no project-local history yet, it is copied on startup; an existing
@@ -250,20 +282,29 @@ every 30 seconds without reloading the page.
 The chart defaults to the current day in the Europe/Helsinki time zone. Choose
 any previous date for a quarter-hour view, or select the previous complete
 calendar week, month, or year for a summary (daily buckets for week/month,
-monthly buckets for year). The chart shows the automatic controller's
-heating-curve shift as a blue line, the spot price, and saved room temperature
-as a green line. The curve shift is the ViCare `shift` value sent to the heating
-curve command, not a measured electrical quantity; no unit is supplied by the
-API. Only periods when automatic control is active have curve-shift samples.
-Chart buckets average saved curve-shift and temperature samples; buckets without
-samples remain blank. Price lines average available quarter-hour prices.
-Daylight-saving changes are accounted for in day lengths.
+monthly buckets for year). The first chart shows the automatic controller's
+heating-curve shift as a blue line and spot price. A separate chart shows room
+temperature as a green line, outdoor temperature as a purple line, and
+heating-circuit supply temperature as a turquoise line. The curve shift is the
+ViCare `shift` value sent to the heating curve command, not a measured
+electrical quantity; no unit is supplied by the API. Only periods when
+automatic control is active have curve-shift samples. Chart buckets average
+saved curve-shift and temperature samples; buckets without samples remain
+blank. Price lines average available quarter-hour prices.
+In the selected-day quarter-hour view, pale green and pale red backgrounds mark
+the cheapest and most expensive quarters respectively, using the same rolling
+next-24-hour price ranking as the controller. Price classification is omitted
+from week/month/year summaries. Daylight-saving changes are accounted for in
+day lengths.
 
-The graph shows Spot-hinta.fi's `PriceWithTax` as a cents/kWh line, the saved
-controller shift as a blue line, and room temperature as a °C line. Compressor
-power or load is not used as a graph series. The
-controller shift and room temperature use independent axes; the price has its
-own scale. Sampling gaps remain blank. The shift line can help compare how the
+The first graph shows Spot-hinta.fi's `PriceWithTax` as a cents/kWh line and
+the saved controller shift as a blue line. A separate temperature graph plots
+room temperature as a green °C line, outdoor temperature as a purple °C line,
+and heating-circuit supply temperature as a turquoise °C line on a shared
+Celsius scale. Compressor power or load is not used as a graph series. The
+controller shift and price use separate scales in the first graph. Sampling
+gaps remain blank. Outdoor and supply temperatures are observed only and do
+not influence automatic control. The shift line can help compare how the
 controller responds to cheap and expensive periods, but it is not a measurement
 of energy use or proof of monetary savings.
 The separately documented cumulative electrical-consumption and thermal

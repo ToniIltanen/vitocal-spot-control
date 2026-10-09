@@ -29,6 +29,8 @@ const QUARTER_SECONDS: i64 = 15 * 60;
 const HEATING_CURVE_FEATURE: &str = "heating.circuits.0.heating.curve";
 const HEATING_MODE_FEATURE: &str = "heating.circuits.0.operating.modes.active";
 const ROOM_TEMPERATURE_FEATURE: &str = "rooms.0.sensors.temperature";
+const OUTDOOR_TEMPERATURE_FEATURE: &str = "heating.sensors.temperature.outside";
+const SUPPLY_TEMPERATURE_FEATURE: &str = "heating.secondaryCircuit.sensors.temperature.supply";
 const MAX_ROOM_TEMPERATURE_AGE_SECONDS: i64 = 60 * 60;
 const COMFORT_MIN_C: f64 = 20.0;
 const COMFORT_MAX_C: f64 = 22.0;
@@ -36,7 +38,7 @@ const FORCED_HEATING_MIN_C: f64 = 19.0;
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-enum ControlMode {
+pub(crate) enum ControlMode {
     Light,
     #[default]
     Normal,
@@ -79,6 +81,10 @@ struct DashboardState {
     compressor_reading_error: Option<String>,
     room_temperature: Option<TemperatureSample>,
     room_temperature_error: Option<String>,
+    outdoor_temperature: Option<OutdoorTemperatureSample>,
+    outdoor_temperature_error: Option<String>,
+    supply_temperature: Option<SupplyTemperatureSample>,
+    supply_temperature_error: Option<String>,
     #[serde(skip)]
     history: History,
 }
@@ -116,6 +122,18 @@ struct TemperatureSample {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct OutdoorTemperatureSample {
+    timestamp: i64,
+    temperature_c: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct SupplyTemperatureSample {
+    timestamp: i64,
+    temperature_c: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct ControlValueSample {
     timestamp: i64,
     curve_shift: f64,
@@ -133,7 +151,8 @@ struct PriceWindow<'a> {
     now: i64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 enum PricePosition {
     Cheap,
     Middle,
@@ -212,6 +231,10 @@ struct History {
     #[serde(default)]
     room_temperatures: Vec<TemperatureSample>,
     #[serde(default)]
+    outdoor_temperatures: Vec<OutdoorTemperatureSample>,
+    #[serde(default)]
+    supply_temperatures: Vec<SupplyTemperatureSample>,
+    #[serde(default)]
     control_values: Vec<ControlValueSample>,
 }
 
@@ -221,7 +244,16 @@ struct ChartPoint {
     energy_kwh: Option<f64>,
     price_cents_per_kwh: Option<f64>,
     room_temperature_c: Option<f64>,
+    outdoor_temperature_c: Option<f64>,
+    supply_temperature_c: Option<f64>,
     curve_shift: Option<f64>,
+    price_position: Option<PricePosition>,
+}
+
+struct TemperatureSeries<'a> {
+    room: &'a [TemperatureSample],
+    outdoor: &'a [OutdoorTemperatureSample],
+    supply: &'a [SupplyTemperatureSample],
 }
 
 #[derive(Debug, Deserialize)]
@@ -239,6 +271,7 @@ pub(crate) async fn run_monitor(
     token_file: &Path,
     heat_pump: &Value,
     room_control: &Value,
+    startup_mode: Option<ControlMode>,
 ) -> Result<()> {
     let dirs =
         directories::ProjectDirs::from("fi", "rust-viessman-control", "rust-viessman-control")
@@ -254,14 +287,32 @@ pub(crate) async fn run_monitor(
     let mut history = read_history(&history_path)?;
     let feature_prefix = device_features_path(heat_pump)?;
     let feature_path = format!("{}/{POWER_FEATURE}", feature_prefix.trim_end_matches('/'));
+    let outdoor_temperature_path = format!(
+        "{}/{}",
+        feature_prefix.trim_end_matches('/'),
+        OUTDOOR_TEMPERATURE_FEATURE
+    );
+    let supply_temperature_path = format!(
+        "{}/{}",
+        feature_prefix.trim_end_matches('/'),
+        SUPPLY_TEMPERATURE_FEATURE
+    );
     let mut sample_interval = interval(SAMPLE_INTERVAL);
     sample_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut last_price_fetch = 0_i64;
     let shared = Arc::new(Mutex::new(DashboardState {
         history: history.clone(),
         room_temperature: history.room_temperatures.last().cloned(),
+        outdoor_temperature: history.outdoor_temperatures.last().cloned(),
+        supply_temperature: history.supply_temperatures.last().cloned(),
         control: UiControlState {
-            status: "Ohjaus pysäytetty".to_owned(),
+            requested_active: startup_mode.is_some(),
+            mode: startup_mode.unwrap_or_default(),
+            status: if startup_mode.is_some() {
+                "Automaattiohjausta käynnistetään...".to_owned()
+            } else {
+                "Ohjaus pysäytetty".to_owned()
+            },
             ..UiControlState::default()
         },
         ..DashboardState::default()
@@ -298,7 +349,14 @@ pub(crate) async fn run_monitor(
     println!(
         "Consumption graph uses the compressor sensor only when ViCare reports watts or kilowatts; percentage readings are not converted to kWh."
     );
-    println!("Price control remains off until started from the dashboard.");
+    if let Some(mode) = startup_mode {
+        println!(
+            "Automatic price control will start in {} mode.",
+            mode.label()
+        );
+    } else {
+        println!("Price control remains off until started from the dashboard.");
+    }
     println!("Stop the service with Ctrl+C.");
 
     loop {
@@ -391,6 +449,54 @@ pub(crate) async fn run_monitor(
                     state.room_temperature = None;
                     state.room_temperature_error = Some(message.clone());
                     eprintln!("Room-temperature sample failed: {message}");
+                }
+            }
+
+            match fetch_outdoor_temperature(http, &token.access_token, &outdoor_temperature_path)
+                .await
+            {
+                Ok(sample) => {
+                    if history
+                        .outdoor_temperatures
+                        .last()
+                        .is_none_or(|previous| previous.timestamp < sample.timestamp)
+                    {
+                        history.outdoor_temperatures.push(sample.clone());
+                    }
+                    let mut state = shared.lock().await;
+                    state.outdoor_temperature = Some(sample);
+                    state.outdoor_temperature_error = None;
+                }
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    let mut state = shared.lock().await;
+                    state.outdoor_temperature = None;
+                    state.outdoor_temperature_error = Some(message.clone());
+                    eprintln!("Outdoor-temperature sample failed: {message}");
+                }
+            }
+
+            match fetch_supply_temperature(http, &token.access_token, &supply_temperature_path)
+                .await
+            {
+                Ok(sample) => {
+                    if history
+                        .supply_temperatures
+                        .last()
+                        .is_none_or(|previous| previous.timestamp < sample.timestamp)
+                    {
+                        history.supply_temperatures.push(sample.clone());
+                    }
+                    let mut state = shared.lock().await;
+                    state.supply_temperature = Some(sample);
+                    state.supply_temperature_error = None;
+                }
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    let mut state = shared.lock().await;
+                    state.supply_temperature = None;
+                    state.supply_temperature_error = Some(message.clone());
+                    eprintln!("Supply-temperature sample failed: {message}");
                 }
             }
 
@@ -922,6 +1028,120 @@ async fn fetch_room_temperature(
     parse_room_temperature(&response, unix_time()?)
 }
 
+fn parse_outdoor_temperature(response: &Value, now: i64) -> Result<OutdoorTemperatureSample> {
+    let data = response
+        .get("data")
+        .context("Viessmann outdoor temperature response did not contain data")?;
+    let feature = if let Some(features) = data.as_array() {
+        features
+            .iter()
+            .find(|feature| {
+                feature.get("feature").and_then(Value::as_str) == Some(OUTDOOR_TEMPERATURE_FEATURE)
+            })
+            .context("Viessmann response did not contain the outdoor temperature sensor")?
+    } else {
+        data
+    };
+    if feature.get("isEnabled").and_then(Value::as_bool) != Some(true) {
+        bail!("Viessmann outdoor temperature sensor is disabled or has no enabled state");
+    }
+    let status = feature
+        .pointer("/properties/status/value")
+        .and_then(Value::as_str)
+        .context("Viessmann outdoor temperature sensor response has no status")?;
+    if status != "connected" {
+        bail!("Viessmann outdoor temperature sensor status is {status}");
+    }
+    let timestamp = feature
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .map(DateTime::parse_from_rfc3339)
+        .transpose()
+        .context("Outdoor temperature feature contains invalid timestamp")?
+        .map(|time| time.timestamp())
+        .unwrap_or(now);
+    if timestamp > now + 60 {
+        bail!("Viessmann outdoor temperature timestamp is in the future");
+    }
+    let temperature = feature
+        .pointer("/properties/value/value")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite() && (-60.0..=60.0).contains(value))
+        .context(
+            "Viessmann outdoor temperature response has no valid temperature (expected -60–60 C)",
+        )?;
+    Ok(OutdoorTemperatureSample {
+        timestamp,
+        temperature_c: temperature,
+    })
+}
+
+fn parse_supply_temperature(response: &Value, now: i64) -> Result<SupplyTemperatureSample> {
+    let data = response
+        .get("data")
+        .context("Viessmann supply temperature response did not contain data")?;
+    let feature = if let Some(features) = data.as_array() {
+        features
+            .iter()
+            .find(|feature| {
+                feature.get("feature").and_then(Value::as_str) == Some(SUPPLY_TEMPERATURE_FEATURE)
+            })
+            .context("Viessmann response did not contain the heating-circuit supply sensor")?
+    } else {
+        data
+    };
+    if feature.get("isEnabled").and_then(Value::as_bool) != Some(true) {
+        bail!("Viessmann supply temperature sensor is disabled or has no enabled state");
+    }
+    let status = feature
+        .pointer("/properties/status/value")
+        .and_then(Value::as_str)
+        .context("Viessmann supply temperature sensor response has no status")?;
+    if status != "connected" {
+        bail!("Viessmann supply temperature sensor status is {status}");
+    }
+    let timestamp = feature
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .map(DateTime::parse_from_rfc3339)
+        .transpose()
+        .context("Supply temperature feature contains invalid timestamp")?
+        .map(|time| time.timestamp())
+        .unwrap_or(now);
+    if timestamp > now + 60 {
+        bail!("Viessmann supply temperature timestamp is in the future");
+    }
+    let temperature = feature
+        .pointer("/properties/value/value")
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite() && (-30.0..=100.0).contains(value))
+        .context(
+            "Viessmann supply temperature response has no valid temperature (expected -30–100 C)",
+        )?;
+    Ok(SupplyTemperatureSample {
+        timestamp,
+        temperature_c: temperature,
+    })
+}
+
+async fn fetch_outdoor_temperature(
+    http: &Client,
+    access_token: &str,
+    feature_path: &str,
+) -> Result<OutdoorTemperatureSample> {
+    let response = api_get(http, access_token, feature_path).await?;
+    parse_outdoor_temperature(&response, unix_time()?)
+}
+
+async fn fetch_supply_temperature(
+    http: &Client,
+    access_token: &str,
+    feature_path: &str,
+) -> Result<SupplyTemperatureSample> {
+    let response = api_get(http, access_token, feature_path).await?;
+    parse_supply_temperature(&response, unix_time()?)
+}
+
 async fn fetch_compressor_reading(
     http: &Client,
     access_token: &str,
@@ -1161,6 +1381,15 @@ fn chart_points_for_period(
     samples.sort_by_key(|sample| sample.timestamp);
     let mut temperatures = history.room_temperatures.clone();
     temperatures.sort_by_key(|sample| sample.timestamp);
+    let mut outdoor_temperatures = history.outdoor_temperatures.clone();
+    outdoor_temperatures.sort_by_key(|sample| sample.timestamp);
+    let mut supply_temperatures = history.supply_temperatures.clone();
+    supply_temperatures.sort_by_key(|sample| sample.timestamp);
+    let temperatures = TemperatureSeries {
+        room: &temperatures,
+        outdoor: &outdoor_temperatures,
+        supply: &supply_temperatures,
+    };
     let mut control_values = history.control_values.clone();
     control_values.sort_by_key(|sample| sample.timestamp);
     Ok(bins
@@ -1171,8 +1400,19 @@ fn chart_points_for_period(
                     timestamp: bin_start,
                     energy_kwh: energy_for_quarter(&samples, bin_start, MAX_SAMPLE_GAP_SECONDS),
                     price_cents_per_kwh: prices.get(&bin_start).copied(),
-                    room_temperature_c: average_temperature(&temperatures, bin_start, bin_end),
+                    room_temperature_c: average_temperature(temperatures.room, bin_start, bin_end),
+                    outdoor_temperature_c: average_outdoor_temperature(
+                        temperatures.outdoor,
+                        bin_start,
+                        bin_end,
+                    ),
+                    supply_temperature_c: average_supply_temperature(
+                        temperatures.supply,
+                        bin_start,
+                        bin_end,
+                    ),
                     curve_shift: average_control_value(&control_values, bin_start, bin_end),
+                    price_position: price_position(&history.prices, bin_start),
                 }
             } else {
                 aggregate_chart_bin(
@@ -1197,7 +1437,7 @@ enum Resolution {
 
 fn aggregate_chart_bin(
     samples: &[PowerSample],
-    temperatures: &[TemperatureSample],
+    temperatures: &TemperatureSeries<'_>,
     control_values: &[ControlValueSample],
     prices: &BTreeMap<i64, f64>,
     start: i64,
@@ -1221,9 +1461,40 @@ fn aggregate_chart_bin(
         timestamp: start,
         energy_kwh,
         price_cents_per_kwh,
-        room_temperature_c: average_temperature(temperatures, start, end),
+        room_temperature_c: average_temperature(temperatures.room, start, end),
+        outdoor_temperature_c: average_outdoor_temperature(temperatures.outdoor, start, end),
+        supply_temperature_c: average_supply_temperature(temperatures.supply, start, end),
         curve_shift: average_control_value(control_values, start, end),
+        price_position: None,
     }
+}
+
+fn average_supply_temperature(
+    samples: &[SupplyTemperatureSample],
+    start: i64,
+    end: i64,
+) -> Option<f64> {
+    let values: Vec<f64> = samples
+        .iter()
+        .filter(|sample| sample.timestamp >= start && sample.timestamp < end)
+        .map(|sample| sample.temperature_c)
+        .filter(|temperature| temperature.is_finite() && (-30.0..=100.0).contains(temperature))
+        .collect();
+    (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
+}
+
+fn average_outdoor_temperature(
+    samples: &[OutdoorTemperatureSample],
+    start: i64,
+    end: i64,
+) -> Option<f64> {
+    let values: Vec<f64> = samples
+        .iter()
+        .filter(|sample| sample.timestamp >= start && sample.timestamp < end)
+        .map(|sample| sample.temperature_c)
+        .filter(|temperature| temperature.is_finite() && (-60.0..=60.0).contains(temperature))
+        .collect();
+    (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
 }
 
 fn average_control_value(samples: &[ControlValueSample], start: i64, end: i64) -> Option<f64> {
@@ -1370,18 +1641,26 @@ fn write_dashboard_atomic(
     .control-key {{ width: 20px; height: 3px; background: #4488d4; vertical-align: 4px; }}
     .line-key {{ width: 20px; height: 3px; background: #e66d4b; vertical-align: 4px; }}
     .temperature-key {{ width: 20px; height: 3px; background: #27845b; vertical-align: 4px; }}
+    .outdoor-temperature-key {{ width: 20px; height: 3px; background: #8957b2; vertical-align: 4px; }}
+    .supply-temperature-key {{ width: 20px; height: 3px; background: #008c95; vertical-align: 4px; }}
+    .cheap-key, .expensive-key {{ width: 14px; height: 14px; }}
+    .cheap-key {{ background: #dff3e5; }}
+    .expensive-key {{ background: #f9e1de; }}
     .chart-wrap {{ position: relative; width: 100%; }}
     canvas {{ display: block; width: 100%; height: min(62vh, 520px); min-height: 340px; }}
-    #tip {{ position: absolute; display: none; pointer-events: none; z-index: 1; padding: 9px 11px; border-radius: 7px; background: #18212b; color: white; font-size: 13px; line-height: 1.5; white-space: nowrap; box-shadow: 0 2px 8px #0003; }}
+    .tip {{ position: absolute; display: none; pointer-events: none; z-index: 1; padding: 9px 11px; border-radius: 7px; background: #18212b; color: white; font-size: 13px; line-height: 1.5; white-space: nowrap; box-shadow: 0 2px 8px #0003; }}
     .note {{ margin: 14px 0 0; font-size: .9rem; line-height: 1.45; }}
     .controls {{ display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }}
     .controls button, .controls select {{ min-height: 40px; padding: 8px 14px; border: 1px solid #b9c7d6; border-radius: 7px; background: white; font: inherit; }}
     .controls button {{ cursor: pointer; font-weight: 650; }}
     #sensor-reading {{ padding: 12px 14px; border-radius: 8px; background: #edf4fb; color: #18344f; font-weight: 650; }}
     #room-temperature-reading {{ padding: 12px 14px; border-radius: 8px; background: #edf7f1; color: #205c3c; font-weight: 650; }}
+    #outdoor-temperature-reading {{ padding: 12px 14px; border-radius: 8px; background: #f4eff9; color: #57377a; font-weight: 650; }}
+    #supply-temperature-reading {{ padding: 12px 14px; border-radius: 8px; background: #edf8f8; color: #07565b; font-weight: 650; }}
     .history-controls {{ display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin: 0 0 16px; }}
     .history-controls select, .history-controls input {{ min-height: 40px; padding: 8px 12px; border: 1px solid #b9c7d6; border-radius: 7px; background: white; font: inherit; }}
     #start {{ background: #176b43; color: white; border-color: #176b43; }}
+    #start.active {{ background: #2469b2; border-color: #2469b2; }}
     #stop {{ background: #a33131; color: white; border-color: #a33131; }}
     #control-status {{ margin: 12px 0 0; line-height: 1.45; }}
     @media (max-width: 600px) {{ body {{ padding: 12px; }} .card {{ padding: 10px; }} }}
@@ -1390,7 +1669,7 @@ fn write_dashboard_atomic(
 <body>
 <main>
   <h1>Vitocal — lämmitysohjaus ja pörssihinta</h1>
-  <div class="subtitle">Lämmityskäyrän siirto ja huonelämpötila suhteessa Spot-hinta.fi:n verolliseen varttihintaan</div>
+  <div class="subtitle">Lämmityskäyrän siirto ja lämpötilat suhteessa Spot-hinta.fi:n verolliseen varttihintaan</div>
   <section class="card" aria-label="Automaattiohjaus">
     <h2>Automaattiohjaus</h2>
     <div class="controls">
@@ -1421,12 +1700,22 @@ fn write_dashboard_atomic(
     <div class="legend">
       <span><i class="key control-key"></i>Lämmityskäyrän siirto (ViCare-arvo, vasen akseli)</span>
       <span><i class="key line-key"></i>Sähkön hinta (c/kWh, oikea akseli)</span>
-      <span><i class="key temperature-key"></i>Huonelämpötila (°C, oikea akseli)</span>
+      <span><i class="key cheap-key"></i>Halpa vartti</span>
+      <span><i class="key expensive-key"></i>Kallis vartti</span>
     </div>
     <p id="sensor-reading" role="status" aria-live="polite">Luetaan kompressorin anturia...</p>
     <p id="room-temperature-reading" role="status" aria-live="polite">Luetaan huonelämpötila-anturia...</p>
-    <div class="chart-wrap"><canvas id="chart" aria-label="Varttikohtainen lämmityskäyrän siirto, sähkön hinta ja huonelämpötila"></canvas><div id="tip"></div></div>
-    <p class="note">Sininen viiva näyttää automaattiohjauksen käyttämän lämmityskäyrän siirtoarvon; arvo tallennetaan ohjauksen ollessa aktiivinen viiden minuutin välein ja aina siirron muuttuessa. Se on ViCare-arvo, ei mitattu sähköteho eikä huoneen lämpötila. Vihreä viiva näyttää tallennettujen huonelämpötilanäytteiden keskiarvon. Näytteettömät jaksot jäävät tyhjiksi. Hintaviiva ja lämpötilaviiva käyttävät oikean reunan eri asteikkoja; ohjausarvo käyttää vasenta asteikkoa. Näkymä päivittyy 30 sekunnin välein. Viimeisin päivitys: <time id="updated"></time>.</p>
+    <p id="outdoor-temperature-reading" role="status" aria-live="polite">Luetaan ulkolämpötila-anturia...</p>
+    <p id="supply-temperature-reading" role="status" aria-live="polite">Luetaan menoveden lämpötila-anturia...</p>
+    <div class="chart-wrap"><canvas id="chart" aria-label="Lämmityskäyrän siirto ja sähkön hinta"></canvas><div id="tip" class="tip"></div></div>
+    <h2>Lämpötilat</h2>
+    <div class="legend">
+      <span><i class="key temperature-key"></i>Sisälämpötila</span>
+      <span><i class="key outdoor-temperature-key"></i>Ulkolämpötila</span>
+      <span><i class="key supply-temperature-key"></i>Menovesi, lämmityspiiri</span>
+    </div>
+    <div class="chart-wrap"><canvas id="temperature-chart" aria-label="Sisä-, ulko- ja menoveden lämpötilat"></canvas><div id="temperature-tip" class="tip"></div></div>
+    <p class="note">Päivän varttinäkymässä vaaleanvihreä tausta merkitsee ohjauksen käyttämän 24 tunnin vertailun halvimpaan neljännekseen kuuluvaa varttia; vaaleanpunainen merkitsee kalleimpaan neljännekseen kuuluvaa varttia. Luokitus päivittyy kullakin vartilla seuraavan 24 tunnin hintojen perusteella kuten ohjauslogiikka. Pidemmän aikavälin yhteenvedoissa väriluokitusta ei näytetä. Sininen viiva näyttää automaattiohjauksen käyttämän lämmityskäyrän siirtoarvon; arvo tallennetaan ohjauksen ollessa aktiivinen viiden minuutin välein ja aina siirron muuttuessa. Se on ViCare-arvo, ei mitattu sähköteho. Lämpötilat näytetään omassa kaaviossaan, jossa on yhteinen °C-asteikko. Ulkolämpötila kerätään vain havainnointia varten; se ei vaikuta ohjauspäätöksiin. Näytteettömät jaksot jäävät tyhjiksi. Näkymä päivittyy 30 sekunnin välein. Viimeisin päivitys: <time id="updated"></time>.</p>
   </section>
 </main>
 <script>
@@ -1436,17 +1725,28 @@ const initialMode = "{control_mode}";
 const canvas = document.getElementById('chart');
 const context = canvas.getContext('2d');
 const tooltip = document.getElementById('tip');
+const temperatureCanvas = document.getElementById('temperature-chart');
+const temperatureContext = temperatureCanvas.getContext('2d');
+const temperatureTooltip = document.getElementById('temperature-tip');
 const formatter = new Intl.DateTimeFormat('fi-FI', {{ timeZone: 'Europe/Helsinki', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }});
 document.getElementById('updated').textContent = formatter.format(new Date(updatedAt * 1000));
 const modeSelect = document.getElementById('control-mode');
 const statusText = document.getElementById('control-status');
+const startButton = document.getElementById('start');
 const sensorReadingText = document.getElementById('sensor-reading');
 const roomTemperatureReadingText = document.getElementById('room-temperature-reading');
+const outdoorTemperatureReadingText = document.getElementById('outdoor-temperature-reading');
+const supplyTemperatureReadingText = document.getElementById('supply-temperature-reading');
 const historyPeriod = document.getElementById('history-period');
 const historyDate = document.getElementById('history-date');
 const historyDateLabel = document.getElementById('history-date-label');
 modeSelect.value = initialMode;
 
+function renderControlButton(control) {{
+  const running = control.active === true;
+  startButton.classList.toggle('active', running);
+  startButton.textContent = running ? 'Muuta ohjausta' : 'Käynnistä ohjaus';
+}}
 async function sendControl(active) {{
   const response = await fetch('/api/control', {{
     method: 'POST',
@@ -1456,8 +1756,11 @@ async function sendControl(active) {{
   if (!response.ok) throw new Error(`Ohjauspyyntö epäonnistui (${{response.status}})`);
   const state = await response.json();
   statusText.textContent = state.control.status;
+  renderControlButton(state.control);
   renderCompressorReading(state);
   renderRoomTemperature(state);
+  renderOutdoorTemperature(state);
+  renderSupplyTemperature(state);
 }}
 function renderCompressorReading(state) {{
   if (state.compressor_reading) {{
@@ -1488,6 +1791,28 @@ function renderRoomTemperature(state) {{
     roomTemperatureReadingText.textContent = 'Huonelämpötilaa ei ole vielä saatavilla.';
   }}
 }}
+function renderOutdoorTemperature(state) {{
+  if (state.outdoor_temperature) {{
+    const reading = state.outdoor_temperature;
+    const time = formatter.format(new Date(reading.timestamp * 1000));
+    outdoorTemperatureReadingText.textContent = `Ulkolämpötila: ${{reading.temperature_c.toFixed(1)}} °C (päivitetty ${{time}}; ei vaikuta ohjaukseen).`;
+  }} else if (state.outdoor_temperature_error) {{
+    outdoorTemperatureReadingText.textContent = `Ulkolämpötilaa ei saatu: ${{state.outdoor_temperature_error}}`;
+  }} else {{
+    outdoorTemperatureReadingText.textContent = 'Ulkolämpötilaa ei ole vielä saatavilla.';
+  }}
+}}
+function renderSupplyTemperature(state) {{
+  if (state.supply_temperature) {{
+    const reading = state.supply_temperature;
+    const time = formatter.format(new Date(reading.timestamp * 1000));
+    supplyTemperatureReadingText.textContent = `Menoveden lämpötila: ${{reading.temperature_c.toFixed(1)}} °C (päivitetty ${{time}}).`;
+  }} else if (state.supply_temperature_error) {{
+    supplyTemperatureReadingText.textContent = `Menoveden lämpötilaa ei saatu: ${{state.supply_temperature_error}}`;
+  }} else {{
+    supplyTemperatureReadingText.textContent = 'Menoveden lämpötilaa ei ole vielä saatavilla.';
+  }}
+}}
 async function refreshControlState() {{
   try {{
     const query = new URLSearchParams({{ period: historyPeriod.value }});
@@ -1496,19 +1821,23 @@ async function refreshControlState() {{
     if (!response.ok) throw new Error(`Tilatietoa ei saatu (${{response.status}})`);
     const state = await response.json();
     statusText.textContent = state.control.status;
+    renderControlButton(state.control);
     renderCompressorReading(state);
     renderRoomTemperature(state);
+    renderOutdoorTemperature(state);
+    renderSupplyTemperature(state);
     const wasShowingToday = historyDate.value === historyDate.max;
     historyDate.max = state.today;
     if (wasShowingToday && historyPeriod.value === 'day') historyDate.value = state.today;
     points = state.points;
     document.getElementById('updated').textContent = formatter.format(new Date(state.updated_at * 1000));
     draw();
+    drawTemperatures();
   }} catch (error) {{
     statusText.textContent = `Yhteys ohjauspalveluun epäonnistui: ${{error.message}}`;
   }}
 }}
-document.getElementById('start').addEventListener('click', () => sendControl(true).catch(error => statusText.textContent = error.message));
+startButton.addEventListener('click', () => sendControl(true).catch(error => statusText.textContent = error.message));
 document.getElementById('stop').addEventListener('click', () => sendControl(false).catch(error => statusText.textContent = error.message));
 function updateHistoryControls() {{
   const isDay = historyPeriod.value === 'day';
@@ -1531,7 +1860,6 @@ function draw() {{
   const left = 66, right = 110, top = 24, bottom = 52;
   const plotW = width - left - right, plotH = height - top - bottom;
   const validPrices = points.map(p => p.price_cents_per_kwh).filter(Number.isFinite);
-  const validTemperatures = points.map(p => p.room_temperature_c).filter(Number.isFinite);
   const validControlValues = points.map(p => p.curve_shift).filter(Number.isFinite);
   let minControl = validControlValues.length ? Math.min(...validControlValues) : -1;
   let maxControl = validControlValues.length ? Math.max(...validControlValues) : 1;
@@ -1543,19 +1871,20 @@ function draw() {{
   if (minPrice === maxPrice) {{ minPrice -= 0.5; maxPrice += 0.5; }}
   const pricePad = (maxPrice - minPrice) * 0.08;
   minPrice -= pricePad; maxPrice += pricePad;
-  let minTemperature = validTemperatures.length ? Math.min(...validTemperatures) : 18;
-  let maxTemperature = validTemperatures.length ? Math.max(...validTemperatures) : 24;
-  if (minTemperature === maxTemperature) {{ minTemperature -= 0.5; maxTemperature += 0.5; }}
-  const temperaturePad = Math.max(0.2, (maxTemperature - minTemperature) * 0.08);
-  minTemperature -= temperaturePad; maxTemperature += temperaturePad;
   const x = index => left + (index + 0.5) * plotW / points.length;
   const yControl = value => top + plotH - (value - minControl) / (maxControl - minControl) * plotH;
   const yPrice = value => top + plotH - (value - minPrice) / (maxPrice - minPrice) * plotH;
-  const yTemperature = value => top + plotH - (value - minTemperature) / (maxTemperature - minTemperature) * plotH;
 
   context.clearRect(0, 0, width, height);
   context.font = '12px system-ui, sans-serif';
   context.textBaseline = 'middle';
+  const slot = plotW / points.length;
+  points.forEach((point, index) => {{
+    if (point.price_position === 'cheap') context.fillStyle = '#e4f4e8';
+    else if (point.price_position === 'expensive') context.fillStyle = '#fbe8e5';
+    else return;
+    context.fillRect(left + index * slot, top, slot + 1, plotH);
+  }});
   context.strokeStyle = '#e7edf3';
   context.fillStyle = '#536273';
   for (let tick = 0; tick <= 4; tick++) {{
@@ -1569,9 +1898,6 @@ function draw() {{
     context.textAlign = 'left';
     context.fillStyle = '#e66d4b';
     context.fillText(priceTick.toFixed(1), width - right + 9, y);
-    const temperatureTick = maxTemperature - (maxTemperature - minTemperature) * tick / 4;
-    context.fillStyle = '#27845b';
-    context.fillText(temperatureTick.toFixed(1), width - right + 52, y);
     context.fillStyle = '#536273';
   }}
   context.strokeStyle = '#e66d4b'; context.fillStyle = '#e66d4b';
@@ -1587,21 +1913,6 @@ function draw() {{
   points.forEach((point, index) => {{
     if (Number.isFinite(point.price_cents_per_kwh)) {{
       context.beginPath(); context.arc(x(index), yPrice(point.price_cents_per_kwh), 2.3, 0, Math.PI * 2); context.fill();
-    }}
-  }});
-  context.strokeStyle = '#27845b'; context.fillStyle = '#27845b';
-  context.lineWidth = 2.3; context.beginPath();
-  connected = false;
-  points.forEach((point, index) => {{
-    if (!Number.isFinite(point.room_temperature_c)) {{ connected = false; return; }}
-    const px = x(index), py = yTemperature(point.room_temperature_c);
-    if (connected) context.lineTo(px, py); else context.moveTo(px, py);
-    connected = true;
-  }});
-  context.stroke();
-  points.forEach((point, index) => {{
-    if (Number.isFinite(point.room_temperature_c)) {{
-      context.beginPath(); context.arc(x(index), yTemperature(point.room_temperature_c), 2.3, 0, Math.PI * 2); context.fill();
     }}
   }});
   context.strokeStyle = '#ffffff';
@@ -1643,7 +1954,90 @@ function draw() {{
   context.save(); context.translate(16, top + plotH / 2); context.rotate(-Math.PI / 2);
   context.textAlign = 'center'; context.fillText('Lämmityskäyrän siirto (ViCare-arvo)', 0, 0); context.restore();
   context.save(); context.translate(width - 12, top + plotH / 2); context.rotate(Math.PI / 2);
-  context.textAlign = 'center'; context.fillText('Hinta (c/kWh) / lämpötila (°C)', 0, 0); context.restore();
+  context.textAlign = 'center'; context.fillText('Hinta (c/kWh)', 0, 0); context.restore();
+}}
+
+function drawTemperatures() {{
+  const ratio = window.devicePixelRatio || 1;
+  const rect = temperatureCanvas.getBoundingClientRect();
+  temperatureCanvas.width = Math.round(rect.width * ratio);
+  temperatureCanvas.height = Math.round(rect.height * ratio);
+  temperatureContext.setTransform(ratio, 0, 0, ratio, 0, 0);
+  const width = rect.width, height = rect.height;
+  const left = 66, right = 24, top = 24, bottom = 52;
+  const plotW = width - left - right, plotH = height - top - bottom;
+  const validTemperatures = points.flatMap(point => [
+    point.room_temperature_c,
+    point.outdoor_temperature_c,
+    point.supply_temperature_c
+  ]).filter(Number.isFinite);
+  let minTemperature = validTemperatures.length ? Math.min(...validTemperatures) : 0;
+  let maxTemperature = validTemperatures.length ? Math.max(...validTemperatures) : 40;
+  if (minTemperature === maxTemperature) {{ minTemperature -= 0.5; maxTemperature += 0.5; }}
+  const padding = Math.max(0.5, (maxTemperature - minTemperature) * 0.08);
+  minTemperature -= padding; maxTemperature += padding;
+  const x = index => left + (index + 0.5) * plotW / points.length;
+  const y = value => top + plotH - (value - minTemperature) / (maxTemperature - minTemperature) * plotH;
+
+  temperatureContext.clearRect(0, 0, width, height);
+  temperatureContext.font = '12px system-ui, sans-serif';
+  temperatureContext.textBaseline = 'middle';
+  temperatureContext.strokeStyle = '#e7edf3';
+  temperatureContext.fillStyle = '#536273';
+  for (let tick = 0; tick <= 4; tick++) {{
+    const tickY = top + tick * plotH / 4;
+    temperatureContext.beginPath();
+    temperatureContext.moveTo(left, tickY);
+    temperatureContext.lineTo(width - right, tickY);
+    temperatureContext.stroke();
+    const value = maxTemperature - (maxTemperature - minTemperature) * tick / 4;
+    temperatureContext.textAlign = 'right';
+    temperatureContext.fillText(value.toFixed(1), left - 9, tickY);
+  }}
+
+  const series = [
+    {{ key: 'room_temperature_c', color: '#27845b' }},
+    {{ key: 'outdoor_temperature_c', color: '#8957b2' }},
+    {{ key: 'supply_temperature_c', color: '#008c95' }}
+  ];
+  for (const item of series) {{
+    temperatureContext.strokeStyle = item.color;
+    temperatureContext.fillStyle = item.color;
+    temperatureContext.lineWidth = 2.3;
+    temperatureContext.beginPath();
+    let connected = false;
+    points.forEach((point, index) => {{
+      const value = point[item.key];
+      if (!Number.isFinite(value)) {{ connected = false; return; }}
+      if (connected) temperatureContext.lineTo(x(index), y(value));
+      else temperatureContext.moveTo(x(index), y(value));
+      connected = true;
+    }});
+    temperatureContext.stroke();
+    points.forEach((point, index) => {{
+      const value = point[item.key];
+      if (Number.isFinite(value)) {{
+        temperatureContext.beginPath();
+        temperatureContext.arc(x(index), y(value), 2.8, 0, Math.PI * 2);
+        temperatureContext.fill();
+      }}
+    }});
+  }}
+
+  temperatureContext.fillStyle = '#536273';
+  temperatureContext.textAlign = 'center';
+  const labelEvery = Math.max(1, Math.ceil(points.length / 12));
+  points.forEach((point, index) => {{
+    if (index % labelEvery === 0) {{
+      temperatureContext.fillText(formatter.format(new Date(point.timestamp * 1000)), x(index), height - 24);
+    }}
+  }});
+  temperatureContext.save();
+  temperatureContext.translate(16, top + plotH / 2);
+  temperatureContext.rotate(-Math.PI / 2);
+  temperatureContext.textAlign = 'center';
+  temperatureContext.fillText('Lämpötila (°C)', 0, 0);
+  temperatureContext.restore();
 }}
 
 canvas.addEventListener('mousemove', event => {{
@@ -1654,16 +2048,33 @@ canvas.addEventListener('mousemove', event => {{
   const point = points[index];
   if (!point) {{ tooltip.style.display = 'none'; return; }}
   const price = Number.isFinite(point.price_cents_per_kwh) ? `${{point.price_cents_per_kwh.toFixed(3)}} c/kWh` : 'hinta ei saatavilla';
-  const temperature = Number.isFinite(point.room_temperature_c) ? `${{point.room_temperature_c.toFixed(1)}} °C` : 'lämpötila ei saatavilla';
   const controlValue = Number.isFinite(point.curve_shift) ? point.curve_shift.toFixed(2) : 'ohjaus ei aktiivinen';
-  tooltip.innerHTML = `${{formatter.format(new Date(point.timestamp * 1000))}}<br>Lämmityskäyrän siirto: ${{controlValue}}<br>Hinta: ${{price}}<br>Huonelämpötila: ${{temperature}}`;
+  const priceClass = point.price_position === 'cheap' ? 'halpa vartti' : point.price_position === 'expensive' ? 'kallis vartti' : 'keskihintainen / ei luokiteltu';
+  tooltip.innerHTML = `${{formatter.format(new Date(point.timestamp * 1000))}}<br>Hintaluokka: ${{priceClass}}<br>Lämmityskäyrän siirto: ${{controlValue}}<br>Hinta: ${{price}}`;
   tooltip.style.display = 'block';
   tooltip.style.left = `${{Math.min(rect.width - 250, Math.max(0, event.clientX - rect.left + 12))}}px`;
   tooltip.style.top = `${{Math.max(0, event.clientY - rect.top - 50)}}px`;
 }});
 canvas.addEventListener('mouseleave', () => tooltip.style.display = 'none');
-window.addEventListener('resize', draw);
+temperatureCanvas.addEventListener('mousemove', event => {{
+  const rect = temperatureCanvas.getBoundingClientRect();
+  const left = 66, right = 24;
+  const fraction = (event.clientX - rect.left - left) / (rect.width - left - right);
+  const index = Math.max(0, Math.min(points.length - 1, Math.floor(fraction * points.length)));
+  const point = points[index];
+  if (!point) {{ temperatureTooltip.style.display = 'none'; return; }}
+  const room = Number.isFinite(point.room_temperature_c) ? `${{point.room_temperature_c.toFixed(1)}} °C` : 'ei näytettä';
+  const outdoor = Number.isFinite(point.outdoor_temperature_c) ? `${{point.outdoor_temperature_c.toFixed(1)}} °C` : 'ei näytettä';
+  const supply = Number.isFinite(point.supply_temperature_c) ? `${{point.supply_temperature_c.toFixed(1)}} °C` : 'ei näytettä';
+  temperatureTooltip.innerHTML = `${{formatter.format(new Date(point.timestamp * 1000))}}<br>Sisälämpö: ${{room}}<br>Ulkolämpö: ${{outdoor}}<br>Menovesi: ${{supply}}`;
+  temperatureTooltip.style.display = 'block';
+  temperatureTooltip.style.left = `${{Math.min(rect.width - 250, Math.max(0, event.clientX - rect.left + 12))}}px`;
+  temperatureTooltip.style.top = `${{Math.max(0, event.clientY - rect.top - 50)}}px`;
+}});
+temperatureCanvas.addEventListener('mouseleave', () => temperatureTooltip.style.display = 'none');
+window.addEventListener('resize', () => {{ draw(); drawTemperatures(); }});
 draw();
+drawTemperatures();
 </script>
 </body>
 </html>
@@ -1850,6 +2261,10 @@ async fn handle_http(
                             "compressor_reading_error": state.compressor_reading_error,
                             "room_temperature": state.room_temperature,
                             "room_temperature_error": state.room_temperature_error,
+                            "outdoor_temperature": state.outdoor_temperature,
+                            "outdoor_temperature_error": state.outdoor_temperature_error,
+                            "supply_temperature": state.supply_temperature,
+                            "supply_temperature_error": state.supply_temperature_error,
                         }))
                         .context("Could not serialize dashboard state")?,
                     ),
@@ -2065,6 +2480,91 @@ mod tests {
     }
 
     #[test]
+    fn parses_outdoor_temperature_and_rejects_invalid_sensor_states() {
+        let now = DateTime::parse_from_rfc3339("2026-10-09T10:01:00Z")
+            .unwrap()
+            .timestamp();
+        let response = json!({"data": [{
+            "feature": OUTDOOR_TEMPERATURE_FEATURE,
+            "isEnabled": true,
+            "timestamp": "2026-10-09T10:00:00Z",
+            "properties": {
+                "status": {"value": "connected"},
+                "value": {"value": -4.5}
+            }
+        }]});
+        assert_eq!(
+            parse_outdoor_temperature(&response, now).unwrap(),
+            OutdoorTemperatureSample {
+                timestamp: now - 60,
+                temperature_c: -4.5,
+            }
+        );
+
+        let mut disconnected = response.clone();
+        disconnected["data"][0]["properties"]["status"]["value"] = json!("notConnected");
+        assert!(
+            parse_outdoor_temperature(&disconnected, now)
+                .unwrap_err()
+                .to_string()
+                .contains("notConnected")
+        );
+        let mut invalid_value = response.clone();
+        invalid_value["data"][0]["properties"]["value"]["value"] = json!(61.0);
+        assert!(parse_outdoor_temperature(&invalid_value, now).is_err());
+        let mut future = response;
+        future["data"][0]["timestamp"] = json!(
+            DateTime::<Utc>::from_timestamp(now + 61, 0)
+                .unwrap()
+                .to_rfc3339()
+        );
+        assert!(parse_outdoor_temperature(&future, now).is_err());
+    }
+
+    #[test]
+    fn old_history_without_outdoor_samples_remains_readable() {
+        let history: History = serde_json::from_value(json!({
+            "power_samples": [],
+            "prices": [],
+            "compressor_readings": [],
+            "room_temperatures": [],
+            "control_values": []
+        }))
+        .unwrap();
+        assert!(history.outdoor_temperatures.is_empty());
+        assert!(history.supply_temperatures.is_empty());
+    }
+
+    #[test]
+    fn parses_heating_circuit_supply_temperature() {
+        let now = DateTime::parse_from_rfc3339("2026-10-09T10:01:00Z")
+            .unwrap()
+            .timestamp();
+        let response = json!({"data": {
+            "feature": SUPPLY_TEMPERATURE_FEATURE,
+            "isEnabled": true,
+            "timestamp": "2026-10-09T10:00:00Z",
+            "properties": {
+                "status": {"value": "connected"},
+                "value": {"value": 32.5, "unit": "celsius"}
+            }
+        }});
+        assert_eq!(
+            parse_supply_temperature(&response, now).unwrap(),
+            SupplyTemperatureSample {
+                timestamp: now - 60,
+                temperature_c: 32.5,
+            }
+        );
+        let mut disconnected = response.clone();
+        disconnected["data"]["properties"]["status"]["value"] = json!("notConnected");
+        assert!(parse_supply_temperature(&disconnected, now).is_err());
+        let mut invalid_temperature = response;
+        invalid_temperature["data"]["properties"]["value"]["value"] = json!(101.0);
+        assert!(parse_supply_temperature(&invalid_temperature, now).is_err());
+    }
+
+    #[test]
     fn computes_energy_for_quarter_only_with_full_sample_coverage() {
         let samples = vec![
             PowerSample {
@@ -2133,6 +2633,14 @@ mod tests {
                 timestamp: 2,
                 temperature_c: 20.5,
             }],
+            outdoor_temperatures: vec![OutdoorTemperatureSample {
+                timestamp: 2,
+                temperature_c: -4.5,
+            }],
+            supply_temperatures: vec![SupplyTemperatureSample {
+                timestamp: 2,
+                temperature_c: 32.5,
+            }],
             control_values: vec![ControlValueSample {
                 timestamp: 3,
                 curve_shift: -3.0,
@@ -2154,6 +2662,20 @@ mod tests {
             vec![TemperatureSample {
                 timestamp: 2,
                 temperature_c: 20.5,
+            }]
+        );
+        assert_eq!(
+            restored.outdoor_temperatures,
+            vec![OutdoorTemperatureSample {
+                timestamp: 2,
+                temperature_c: -4.5,
+            }]
+        );
+        assert_eq!(
+            restored.supply_temperatures,
+            vec![SupplyTemperatureSample {
+                timestamp: 2,
+                temperature_c: 32.5,
             }]
         );
         assert_eq!(
@@ -2238,21 +2760,47 @@ mod tests {
                 temperature_c: 20.0 + step as f64,
             })
             .collect();
+        let outdoor_temperatures: Vec<_> = (0..4)
+            .map(|step| OutdoorTemperatureSample {
+                timestamp: step * QUARTER_SECONDS + 60,
+                temperature_c: -5.0 + step as f64,
+            })
+            .collect();
+        let supply_temperatures: Vec<_> = (0..4)
+            .map(|step| SupplyTemperatureSample {
+                timestamp: step * QUARTER_SECONDS + 60,
+                temperature_c: 30.0 + step as f64,
+            })
+            .collect();
         let control_values: Vec<_> = (0..4)
             .map(|step| ControlValueSample {
                 timestamp: step * QUARTER_SECONDS + 60,
                 curve_shift: -4.0 + step as f64,
             })
             .collect();
-        let complete =
-            aggregate_chart_bin(&samples, &temperatures, &control_values, &prices, 0, 3600);
+        let temperature_series = TemperatureSeries {
+            room: &temperatures,
+            outdoor: &outdoor_temperatures,
+            supply: &supply_temperatures,
+        };
+        let complete = aggregate_chart_bin(
+            &samples,
+            &temperature_series,
+            &control_values,
+            &prices,
+            0,
+            3600,
+        );
         assert_eq!(complete.energy_kwh, Some(2.0));
         assert_eq!(complete.price_cents_per_kwh, Some(11.5));
         assert_eq!(complete.room_temperature_c, Some(21.5));
+        assert_eq!(complete.outdoor_temperature_c, Some(-3.5));
+        assert_eq!(complete.supply_temperature_c, Some(31.5));
         assert_eq!(complete.curve_shift, Some(-2.5));
+        assert_eq!(complete.price_position, None);
         let incomplete = aggregate_chart_bin(
             &samples[1..],
-            &temperatures,
+            &temperature_series,
             &control_values,
             &prices,
             0,
@@ -2287,7 +2835,14 @@ mod tests {
     fn quarter_chart_bins_average_temperature_readings_and_keep_empty_bins_blank() {
         let date = NaiveDate::from_ymd_opt(2026, 10, 9).unwrap();
         let start = local_midnight(date).unwrap();
+        let prices: Vec<_> = (0..96)
+            .map(|slot| PricePoint {
+                timestamp: start + slot * QUARTER_SECONDS,
+                price_eur_per_kwh: slot as f64,
+            })
+            .collect();
         let history = History {
+            prices,
             room_temperatures: vec![
                 TemperatureSample {
                     timestamp: start + 60,
@@ -2296,6 +2851,26 @@ mod tests {
                 TemperatureSample {
                     timestamp: start + QUARTER_SECONDS + 60,
                     temperature_c: 21.0,
+                },
+            ],
+            outdoor_temperatures: vec![
+                OutdoorTemperatureSample {
+                    timestamp: start + 60,
+                    temperature_c: -2.0,
+                },
+                OutdoorTemperatureSample {
+                    timestamp: start + QUARTER_SECONDS + 60,
+                    temperature_c: -1.0,
+                },
+            ],
+            supply_temperatures: vec![
+                SupplyTemperatureSample {
+                    timestamp: start + 60,
+                    temperature_c: 31.0,
+                },
+                SupplyTemperatureSample {
+                    timestamp: start + QUARTER_SECONDS + 60,
+                    temperature_c: 32.0,
                 },
             ],
             control_values: vec![
@@ -2316,9 +2891,17 @@ mod tests {
         assert_eq!(points[0].room_temperature_c, Some(20.0));
         assert_eq!(points[1].room_temperature_c, Some(21.0));
         assert_eq!(points[2].room_temperature_c, None);
+        assert_eq!(points[0].outdoor_temperature_c, Some(-2.0));
+        assert_eq!(points[1].outdoor_temperature_c, Some(-1.0));
+        assert_eq!(points[2].outdoor_temperature_c, None);
+        assert_eq!(points[0].supply_temperature_c, Some(31.0));
+        assert_eq!(points[1].supply_temperature_c, Some(32.0));
+        assert_eq!(points[2].supply_temperature_c, None);
         assert_eq!(points[0].curve_shift, Some(-3.5));
         assert_eq!(points[1].curve_shift, Some(-4.5));
         assert_eq!(points[2].curve_shift, None);
+        assert_eq!(points[0].price_position, Some(PricePosition::Cheap));
+        assert_eq!(points[95].price_position, None);
     }
 
     #[test]
@@ -2460,7 +3043,10 @@ mod tests {
             energy_kwh: Some(0.25),
             price_cents_per_kwh: Some(3.765),
             room_temperature_c: Some(20.5),
+            outdoor_temperature_c: Some(-4.5),
+            supply_temperature_c: Some(32.5),
             curve_shift: Some(-3.0),
+            price_position: Some(PricePosition::Cheap),
         }];
         let control = UiControlState {
             status: "Ohjaus pysäytetty".to_owned(),
@@ -2474,15 +3060,24 @@ mod tests {
         assert!(html.contains("curve_shift"));
         assert!(html.contains("price_cents_per_kwh"));
         assert!(html.contains("room_temperature_c"));
+        assert!(html.contains("outdoor_temperature_c"));
+        assert!(html.contains("supply_temperature_c"));
         assert!(html.contains("Lämmityskäyrän siirto"));
-        assert!(
-            html.find("context.strokeStyle = '#27845b'")
-                < html.rfind("context.strokeStyle = '#1769aa'")
-        );
+        assert!(html.contains("id=\"temperature-chart\""));
+        assert!(html.contains("id=\"temperature-tip\""));
+        assert!(html.contains("function drawTemperatures()"));
+        assert!(html.contains("temperatureCanvas.addEventListener('mousemove'"));
         assert!(html.contains("context.arc(x(index), yControl(point.curve_shift), 4"));
         assert!(html.contains("Huonelämpötila"));
+        assert!(html.contains("Ulkolämpötila"));
+        assert!(html.contains("Menovesi"));
+        assert!(html.contains("renderSupplyTemperature"));
+        assert!(html.contains("ei vaikuta ohjaukseen"));
         assert!(html.contains("Spot-hinta"));
         assert!(html.contains("Käynnistä ohjaus"));
+        assert!(html.contains("Muuta ohjausta"));
+        assert!(html.contains("#start.active"));
+        assert!(html.contains("function renderControlButton(control)"));
         assert!(html.contains("Pysäytä ja palauta asetukset"));
         assert!(html.contains("api/control"));
         assert!(html.contains("sensor-reading"));
